@@ -16,6 +16,10 @@ import pathlib
 import pickle
 import json
 import argparse
+# import re
+
+# mat = re.compile("_module\.(.*)")
+# module_mat = re.compile("_module.(.*)")
 
 parser = argparse.ArgumentParser()
 
@@ -282,29 +286,28 @@ class User:
     test_loader = DataLoader(
       DatasetSplit(data, test_idxs),
       #batch_size=self.params.test_batch_size,
-      batch_size = int(len(idxs) * 0.8),
+      batch_size = int(len(idxs) * 0.2),
       shuffle=True
     )
 
     # return train_loader
     return train_loader, test_loader
-    
 
   def train(self, model):
     optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
 
-    print("noise\t", self.params.noise_multiplier)
-
-    model, optimizer, train_loader = privacy_engine.make_private(
-        module=model,
-        optimizer=optimizer,
-        data_loader=self.train_loader,
-        noise_multiplier=self.params.noise_multiplier,
-        max_grad_norm=1,
-    )
-
-    # else:
-    #   train_loader = self.train_loader
+    if self.params.noise_multiplier != 0:
+      print("noise\t", self.params.noise_multiplier)
+      model, optimizer, train_loader = privacy_engine.make_private(
+          module=model,
+          optimizer=optimizer,
+          data_loader=self.train_loader,
+          noise_multiplier=self.params.noise_multiplier,
+          max_grad_norm=1,
+      )
+    else:
+      print("w/o noise")
+      train_loader = self.train_loader
     
     epoch_loss = []
 
@@ -344,9 +347,6 @@ class User:
     result = calc_evaluation_score(X, y, model)
     
     return result
-
-import re
-mat = re.compile("_module\.(.*)")
 
 def train_loop(model, users, ptn):
   global_model = model
@@ -390,16 +390,25 @@ def train_loop(model, users, ptn):
     
     ## パラメータを統合する
     avg_weights = {}
-    for key in local_weights[0].keys():
-      global_key = mat.match(key).group(1)
+    for key_id, global_key in enumerate(global_model.state_dict().keys()):
+    # for global_key in global_model.state_dict().keys():
+      #global_key = mat.match(key).group(1)
+      key = list(local_weights[0].keys())[key_id]
       avg_weights[global_key] = torch.mul(local_weights[0][key], (float(len(users[0].idxs)) / dataset_cnt))
       for i in range(1, len(local_weights)):
+        key = list(local_weights[i].keys())[key_id]
         avg_weights[global_key] += torch.mul(local_weights[i][key], (float(len(users[i].idxs)) / dataset_cnt))
       # avg_weights[key] = torch.div(avg_weights[key], len(local_weights))
 
     ## パラメータをモデルに反映させる
 
-    print("update the global model")
+    assert len(avg_weights) == len(global_model.state_dict()), "local models must be the same shape as the global model"
+
+    # print("update the global model")
+    # for old_key in avg_weights:
+    #     new_key = module_mat.match(old_key).group(1)
+    #     avg_weights[new_key] = avg_weights.pop(old_key)
+
     global_model.load_state_dict(avg_weights)
 
     # test loop
@@ -421,6 +430,7 @@ def train_loop(model, users, ptn):
         list_precision.append(result['precision'])
         list_auroc.append(result['auroc'])
         list_f1.append(result['f1'])
+        
 
     local_loss_list.append(list_loss)
     local_acc_list.append(list_acc)
@@ -432,6 +442,16 @@ def train_loop(model, users, ptn):
     print("average scores of all users:")
     print(f"AUROC: {sum(list_auroc) / len(list_auroc)}\nF1: {sum(list_f1) / len(list_f1)}\nAccuracy: {sum(list_acc) / len(list_acc)}\nRecall: {sum(list_recall) / len(list_recall)}\nPrecision: {sum(list_precision) / len(list_precision)}\nAvg Loss: {sum(list_loss) / len(list_loss)}\n")
   
+    # early stopping
+    if (epoch >= 10) and (len(local_auroc_list) > n_early_stopping+1):
+      print(local_auroc_list[-1][0], local_auroc_list[-1-n_early_stopping][0])
+      if local_auroc_list[-1][0] <= local_auroc_list[-1-n_early_stopping][0]:
+        args["stopped_round"].append(epoch)
+        print(f"early stop at global epoch {epoch} warn: (the model is at {epoch})")
+        break
+    if epoch == n_global_iterations-1:
+      args["stopped_round"].append(epoch)
+
   return local_loss_list, local_acc_list, local_recall_list, local_precision_list, local_auroc_list, local_f1_list
 
 
@@ -449,6 +469,7 @@ parser.add_argument('--n_small_users', type=int, default=4)
 parser.add_argument('--noise_for_small', type=float, default=0)
 parser.add_argument('--noise_for_large', type=float, default=0)
 parser.add_argument('--share_abnormal_ratio', type=float, default=0)
+parser.add_argument('--n_early_stopping', type=int, default=5)
 
 parser.add_argument('--no_dp', action='store_true')
 args = parser.parse_args()
@@ -469,6 +490,7 @@ abnormal_ratio_for_small = 0.1
 abnormal_ratio_for_large = 0.5
 ITR = args.n_iterations
 share_abnormal_ratio = args.share_abnormal_ratio
+n_early_stopping = args.n_early_stopping
 
 if noise_for_small == 0:
     eps = float("inf")
@@ -479,7 +501,7 @@ args = {"n_global_iterations": n_global_iterations, "learning_rate":learning_rat
 "noise_for_large": noise_for_large, "n_epoch_in_large": n_epoch_in_large, "n_epoch_in_small":n_epoch_in_small,
 "batch_for_large": batch_for_large, "data_size_for_small": data_size_for_small, "n_small_users": n_small_users,
 "n_large_users": n_large_users, "abnormal_ratio_for_small": abnormal_ratio_for_small, "abnormal_ratio_for_large": abnormal_ratio_for_large,
-"n_global_iterations": n_global_iterations, "ITR": ITR, "epsilon": eps, "share_abnormal_ratio": share_abnormal_ratio}
+"n_global_iterations": n_global_iterations, "ITR": ITR, "epsilon": eps, "share_abnormal_ratio": share_abnormal_ratio, "n_early_stopping": n_early_stopping, "stopped_round": []}
 
 with open(result_dir / 'param.json', 'w') as f:
     json.dump(args, f, indent=4)
@@ -499,12 +521,14 @@ print(f"A small user guarantees ({eps},{1e-5})-DP")
 
 abnormal_label = 1
 
-
 abnormal_idxs, normal_idxs = get_indices_with_label(train_data, abnormal_label)
 user_idxs_list = get_user_indices(data_allocation, normal_idxs, abnormal_idxs)
 
 user_hyper_params_large = UserHyperParams(batch_size=batch_for_large, epoch=n_epoch_in_large, log_per=20, noise_multiplier=noise_for_large)
 user_hyper_params_small = UserHyperParams(batch_size=batch_for_small, epoch=n_epoch_in_small, log_per=20, noise_multiplier=noise_for_small)
+
+test_X = torch.tensor(test_data.data, dtype=torch.float32).reshape(-1,1,28,28).to(device)
+test_y = test_data.targets.cpu()
 
 print(f"User count: {len(user_idxs_list)}")
 users = []
@@ -515,12 +539,21 @@ for (j, idxs) in enumerate(user_idxs_list):
     else:
         users.append(User(j, train_data, idxs, user_hyper_params_small))
 
-avg_local_losses = np.zeros((n_global_iterations, len(users)))
-avg_local_accs = np.zeros((n_global_iterations, len(users)))
-avg_local_recalls = np.zeros((n_global_iterations, len(users)))
-avg_local_precisions = np.zeros((n_global_iterations, len(users)))
-avg_local_aurocs = np.zeros((n_global_iterations, len(users)))
-avg_local_f1s = np.zeros((n_global_iterations, len(users)))
+# avg_local_losses = np.zeros((n_global_iterations, len(users)))
+# avg_local_accs = np.zeros((n_global_iterations, len(users)))
+# avg_local_recalls = np.zeros((n_global_iterations, len(users)))
+# avg_local_precisions = np.zeros((n_global_iterations, len(users)))
+# avg_local_aurocs = np.zeros((n_global_iterations, len(users)))
+# avg_local_f1s = np.zeros((n_global_iterations, len(users)))
+
+avg_local_losses = []
+avg_local_accs = []
+avg_local_recalls = []
+avg_local_precisions = []
+avg_local_aurocs = []
+avg_local_f1s = []
+
+scores = []
 
 for i in range(ITR):
     # モデルのリセット
@@ -533,18 +566,34 @@ for i in range(ITR):
     _local_auroc_list,
     _local_f1_list) = train_loop(model, users, 0)
 
-    assert(avg_local_losses.shape == np.array(_local_loss_list).shape)
+    model.eval()
 
-    avg_local_losses += np.array(_local_loss_list, dtype=float) / ITR
-    avg_local_accs += np.array(_local_acc_list, dtype=float) / ITR
-    avg_local_recalls += np.array(_local_recall_list, dtype=float) / ITR
-    avg_local_precisions += np.array(_local_precision_list, dtype=float) /ITR
-    avg_local_aurocs += np.array(_local_auroc_list, dtype=float) /ITR
-    avg_local_f1s += np.array(_local_f1_list, dtype=float) /ITR
+    scores.append(calc_evaluation_score(test_X, test_y, model))
+
+    #assert(avg_local_losses.shape == np.array(_local_loss_list).shape)
+    # avg_local_losses += np.array(_local_loss_list, dtype=float) / ITR
+    # avg_local_accs += np.array(_local_acc_list, dtype=float) / ITR
+    # avg_local_recalls += np.array(_local_recall_list, dtype=float) / ITR
+    # avg_local_precisions += np.array(_local_precision_list, dtype=float) /ITR
+    # avg_local_aurocs += np.array(_local_auroc_list, dtype=float) /ITR
+    # avg_local_f1s += np.array(_local_f1_list, dtype=float) /ITR
+
+    avg_local_losses.append(_local_loss_list)
+    avg_local_accs.append(_local_acc_list)
+    avg_local_recalls.append(_local_recall_list)
+    avg_local_precisions.append(_local_precision_list)
+    avg_local_aurocs.append(_local_auroc_list)
+    avg_local_f1s.append(_local_f1_list)
 
 results = (avg_local_losses, avg_local_accs, avg_local_recalls, avg_local_precisions, avg_local_aurocs, avg_local_f1s)
 
 with open(result_dir / "result.pkl", "wb") as f:
     pickle.dump(results, f)
+
+with open(result_dir / "scores.pkl", "wb") as f:
+    pickle.dump(scores, f)
+
+with open(result_dir / 'param.json', 'w') as f:
+    json.dump(args, f, indent=4)
 
 print(f"finish")
